@@ -1,0 +1,819 @@
+## =============================================================================
+## adipose_immune_deconvolution.R
+##
+## Adipose Tissue Immune Cell Deconvolution
+## Method: NNLS (Non-Negative Least Squares) + CIBERSORTx output files
+## Reference: Human immune single-cell atlas (human_immune.rds)
+## Depots: Abdominal (AB), Subcutaneous (SQ)
+## Timepoints: Baseline, Developing Obesity (Middle), Prolonged Obesity (End)
+## Design: Paired repeated measures, 8 cats
+##
+## Inputs (place in data/ directory):
+##   data/gene_count_matrix.csv
+##   data/sample_metadata_parsed.csv
+##   data/gene_mapping_final.csv
+##   data/cat_ensembl_annotation.csv
+##   data/human_immune.rds
+##
+## Outputs (written to deconv_output/):
+##   adipose_TPM.csv
+##   adipose_immune_deconvolution_results.csv
+##   human_immune_signature_matrix.csv
+##   signature_matrix_cat_genes.csv
+##   cat_human_ortholog_mapping.csv
+##   CIBERSORTx_mixture_adipose.txt
+##   CIBERSORTx_signature_adipose.txt
+##   immune_summary_proportion_table.csv
+##   immune_statistical_tests_*.csv
+##   immune_cell_type_reference.csv
+##   IMMUNE_0*.pdf  (8 exploratory plots)
+##   IMMUNE_publication_*.pdf/.png  (3 publication-ready plots)
+## =============================================================================
+
+# Set your working directory to the repo root, or update this path:
+# setwd("path/to/adipose-deconv")
+
+## -----------------------------------------------------------------------------
+## Libraries
+## -----------------------------------------------------------------------------
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(Seurat)
+  library(biomaRt)
+  library(SingleCellExperiment)
+  library(nnls)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(reshape2)
+  library(viridis)
+})
+
+## -----------------------------------------------------------------------------
+## Output directory
+## -----------------------------------------------------------------------------
+
+dir.create("deconv_output", showWarnings = FALSE)
+
+## -----------------------------------------------------------------------------
+## Color palettes (used across multiple plots)
+## -----------------------------------------------------------------------------
+
+depot_colors     <- c("Abdominal" = "#E94B3C", "Subcutaneous" = "#4A90E2")
+timepoint_colors <- c("Baseline"           = "#66C2A5",
+                      "Developing obesity" = "#FC8D62",
+                      "Prolonged Obesity"  = "#8DA0CB")
+
+## =============================================================================
+## PART 1: LOAD BULK RNA-SEQ DATA
+## =============================================================================
+
+cat("=== PART 1: Loading Cat Adipose Bulk RNA-Seq Data ===\n")
+
+# Read count matrix; first column holds gene/Ensembl IDs
+adipose_counts_raw <- read.csv("data/gene_count_matrix.csv",
+                               check.names = FALSE,
+                               stringsAsFactors = FALSE)
+
+cat("Dimensions (raw):", dim(adipose_counts_raw), "\n")
+
+gene_col <- adipose_counts_raw[, 1]
+cat("Total genes:", length(gene_col),
+    "| Missing:", sum(is.na(gene_col)),
+    "| Duplicates:", sum(duplicated(gene_col)), "\n")
+
+# Drop rows with missing gene IDs, then make remaining IDs unique
+if (sum(is.na(gene_col)) > 0) {
+  adipose_counts_raw <- adipose_counts_raw[!is.na(gene_col), ]
+  gene_col <- adipose_counts_raw[, 1]
+}
+adipose_counts_raw[, 1] <- make.unique(as.character(gene_col))
+rownames(adipose_counts_raw) <- adipose_counts_raw[, 1]
+adipose_counts_raw <- adipose_counts_raw[, -1]
+
+cat("Genes:", nrow(adipose_counts_raw),
+    "| Samples:", ncol(adipose_counts_raw), "\n\n")
+
+# Load and align metadata
+metadata <- read.csv("data/sample_metadata_parsed.csv", stringsAsFactors = FALSE)
+cat("Metadata loaded:", nrow(metadata), "samples\n")
+cat("Timepoints:", paste(unique(metadata$Timepoint), collapse = ", "), "\n")
+cat("Depots:",     paste(unique(metadata$Depot),     collapse = ", "), "\n\n")
+
+colnames(adipose_counts_raw) <- gsub("\\.raw$", "", colnames(adipose_counts_raw))
+common_samples <- intersect(colnames(adipose_counts_raw), metadata$library_ID)
+cat("Common samples:", length(common_samples), "\n")
+if (length(common_samples) == 0) stop("No matching samples between count matrix and metadata.")
+
+adipose_counts <- adipose_counts_raw[, common_samples]
+metadata       <- metadata[match(common_samples, metadata$library_ID), ]
+rownames(metadata) <- metadata$library_ID
+
+cat("Final matrix:", dim(adipose_counts), "\n\n")
+
+## =============================================================================
+## PART 2: NORMALIZE TO TPM
+## =============================================================================
+
+cat("=== PART 2: Normalizing to TPM ===\n")
+
+# Compute TPM using a constant 1 kb gene length (no GTF provided)
+calculate_tpm <- function(counts, gene_lengths = NULL) {
+  if (is.null(gene_lengths)) {
+    gene_lengths <- rep(1000, nrow(counts))
+    cat("Note: Using constant gene length (1 kb) for TPM\n")
+  }
+  counts <- as.matrix(counts)
+  counts[is.na(counts)] <- 0
+  rpk <- counts / (gene_lengths / 1000)
+  sf  <- colSums(rpk, na.rm = TRUE) / 1e6
+  sf[sf == 0] <- 1
+  tpm <- sweep(rpk, 2, sf, "/")
+  tpm[is.na(tpm) | is.infinite(tpm)] <- 0
+  tpm
+}
+
+adipose_tpm <- calculate_tpm(adipose_counts)
+cat("TPM matrix:", dim(adipose_tpm), "\n")
+
+# Sanity-check End samples (they can silently become all-zero)
+end_sample_ids <- metadata$library_ID[metadata$Timepoint == "End"]
+end_tpm_sums   <- sapply(end_sample_ids, function(sid) {
+  if (sid %in% colnames(adipose_tpm)) sum(adipose_tpm[, sid], na.rm = TRUE) else 0
+})
+
+if (all(end_tpm_sums == 0)) {
+  cat("WARNING: TPM failed for End samples — falling back to log2(counts + 1)\n")
+  adipose_tpm <- log2(adipose_counts + 1)
+  write.csv(adipose_tpm, "deconv_output/adipose_log_normalized.csv")
+  cat("Saved: adipose_log_normalized.csv\n\n")
+} else {
+  write.csv(adipose_tpm, "deconv_output/adipose_TPM.csv")
+  cat("Saved: adipose_TPM.csv\n\n")
+}
+
+## =============================================================================
+## PART 3: LOAD HUMAN IMMUNE SINGLE-CELL REFERENCE
+## =============================================================================
+
+cat("=== PART 3: Loading Human Immune Single-Cell Reference ===\n")
+
+human_ref <- readRDS("data/human_immune.rds")
+cat("Cells:", ncol(human_ref), "| Genes:", nrow(human_ref), "\n")
+cat("Metadata columns:", paste(colnames(human_ref@meta.data), collapse = ", "), "\n\n")
+
+# Auto-detect the cell-type annotation column
+candidate_cols  <- c("cell_type", "celltype", "cluster", "annotation",
+                     "celltype_major", "cell_type_major", "final_annotation")
+cell_type_col   <- NULL
+
+for (col in candidate_cols) {
+  if (col %in% colnames(human_ref@meta.data)) { cell_type_col <- col; break }
+}
+
+# Fall back: pick any column with 3–100 unique values
+if (is.null(cell_type_col)) {
+  for (col in colnames(human_ref@meta.data)) {
+    n <- length(unique(human_ref@meta.data[[col]]))
+    if (n > 3 && n < 100) { cell_type_col <- col; break }
+  }
+}
+
+if (is.null(cell_type_col)) stop("Could not identify cell-type column in reference.")
+cat("Cell-type column:", cell_type_col, "\n")
+
+cell_type_table    <- table(human_ref@meta.data[[cell_type_col]])
+cell_types_to_keep <- names(cell_type_table[cell_type_table >= 30])
+cat("Keeping", length(cell_types_to_keep), "cell types (>= 30 cells each)\n")
+
+cells_to_keep <- rownames(human_ref@meta.data)[
+  human_ref@meta.data[[cell_type_col]] %in% cell_types_to_keep
+]
+human_ref <- subset(human_ref, cells = cells_to_keep)
+cat("Reference after filtering:", ncol(human_ref), "cells\n\n")
+
+## =============================================================================
+## PART 4: BUILD CELL-TYPE SIGNATURE MATRIX
+## =============================================================================
+
+cat("=== PART 4: Building Signature Matrix ===\n")
+
+# Normalize if needed — compatible with Seurat v4 and v5
+get_assay_data <- function(obj, layer = "data") {
+  tryCatch(LayerData(obj, assay = "RNA", layer = layer), error = function(e)
+    tryCatch(GetAssayData(obj, assay = "RNA", layer = layer), error = function(e2)
+      obj@assays$RNA@data))
+}
+
+check_normalized <- function(obj) {
+  d <- get_assay_data(obj, "data")
+  !is.null(d) && sum(d) > 0
+}
+
+if (!check_normalized(human_ref)) {
+  cat("Normalizing reference...\n")
+  human_ref <- NormalizeData(human_ref, verbose = FALSE)
+}
+
+human_expr  <- get_assay_data(human_ref, "data")
+cell_types  <- human_ref@meta.data[[cell_type_col]]
+
+# Average expression per cell type → signature matrix
+signature_matrix <- sapply(unique(cell_types), function(ct) {
+  rowMeans(as.matrix(human_expr[, cell_types == ct]))
+})
+
+cat("Signature matrix:", dim(signature_matrix),
+    "(genes x cell types)\n\n")
+write.csv(signature_matrix, "deconv_output/human_immune_signature_matrix.csv")
+
+## =============================================================================
+## PART 5: MAP CAT ENSEMBL IDs TO HUMAN GENE SYMBOLS
+## =============================================================================
+
+cat("=== PART 5: Mapping Cat Genes to Human Symbols ===\n")
+
+# Load annotation files — prefer gene_mapping_final.csv if it has gene symbols
+cat_annotation <- read.csv("data/cat_ensembl_annotation.csv", stringsAsFactors = FALSE)
+gene_mapping   <- read.csv("data/gene_mapping_final.csv",     stringsAsFactors = FALSE)
+
+cat_gene_info <- if (any(c("gene_name", "external_gene_name") %in% colnames(gene_mapping))) {
+  cat("Using gene_mapping_final.csv\n"); gene_mapping
+} else {
+  cat("Using cat_ensembl_annotation.csv\n"); cat_annotation
+}
+
+# Auto-detect Ensembl ID and gene symbol columns
+find_col <- function(df, candidates) {
+  candidates[candidates %in% colnames(df)][1]
+}
+ensembl_col <- find_col(cat_gene_info, c("ensembl_gene_id","gene_id","Gene.stable.ID","ensembl_id"))
+symbol_col  <- find_col(cat_gene_info, c("external_gene_name","gene_name","Gene.name","symbol","gene_symbol"))
+
+if (is.na(ensembl_col) || is.na(symbol_col)) {
+  cat("Available columns:", paste(colnames(cat_gene_info), collapse = ", "), "\n")
+  stop("Cannot identify Ensembl or symbol columns — edit find_col() candidates above.")
+}
+cat("Ensembl column:", ensembl_col, "| Symbol column:", symbol_col, "\n")
+
+cat_gene_mapping <- data.frame(
+  ensembl_id  = as.character(cat_gene_info[[ensembl_col]]),
+  gene_symbol = as.character(cat_gene_info[[symbol_col]]),
+  stringsAsFactors = FALSE
+)
+cat_gene_mapping <- cat_gene_mapping[
+  !is.na(cat_gene_mapping$gene_symbol) & cat_gene_mapping$gene_symbol != "", ]
+cat_gene_mapping <- cat_gene_mapping[!duplicated(cat_gene_mapping$ensembl_id), ]
+cat_gene_mapping <- cat_gene_mapping[
+  cat_gene_mapping$ensembl_id %in% rownames(adipose_tpm), ]
+cat("Cat genes with annotations present in bulk data:", nrow(cat_gene_mapping), "\n")
+
+# Match cat symbols to human reference symbols (case-insensitive)
+human_genes      <- rownames(signature_matrix)
+common_upper     <- intersect(toupper(cat_gene_mapping$gene_symbol), toupper(human_genes))
+
+orthologs_filtered <- data.frame(
+  human_gene = human_genes[match(common_upper, toupper(human_genes))],
+  cat_gene   = cat_gene_mapping$ensembl_id[match(common_upper, toupper(cat_gene_mapping$gene_symbol))],
+  cat_symbol = cat_gene_mapping$gene_symbol[match(common_upper, toupper(cat_gene_mapping$gene_symbol))],
+  stringsAsFactors = FALSE
+)
+orthologs_filtered <- orthologs_filtered[complete.cases(orthologs_filtered), ]
+
+cat("Orthologous genes matched:", nrow(orthologs_filtered),
+    sprintf("(%.1f%% of human signature genes)\n\n",
+            100 * nrow(orthologs_filtered) / length(human_genes)))
+
+if (nrow(orthologs_filtered) < 500)  warning("Fewer than 500 orthologous genes — deconvolution quality may be reduced.")
+if (nrow(orthologs_filtered) >= 500) cat("Gene coverage:", nrow(orthologs_filtered), "\n\n")
+
+write.csv(orthologs_filtered, "deconv_output/cat_human_ortholog_mapping.csv", row.names = FALSE)
+
+## =============================================================================
+## PART 6: ALIGN MATRICES FOR DECONVOLUTION
+## =============================================================================
+
+cat("=== PART 6: Aligning Matrices ===\n")
+
+signature_final    <- signature_matrix[orthologs_filtered$human_gene, ]
+rownames(signature_final) <- orthologs_filtered$cat_gene
+
+adipose_bulk_final <- as.matrix(adipose_tpm[orthologs_filtered$cat_gene, ])
+mode(adipose_bulk_final) <- "numeric"
+
+# Remove any all-zero genes and replace NA / Inf
+signature_final[is.na(signature_final) | is.infinite(signature_final)] <- 0
+adipose_bulk_final[is.na(adipose_bulk_final) | is.infinite(adipose_bulk_final)] <- 0
+
+keep_genes      <- rowSums(signature_final) > 0
+signature_final    <- signature_final[keep_genes, ]
+adipose_bulk_final <- adipose_bulk_final[keep_genes, ]
+
+common_genes <- intersect(rownames(signature_final), rownames(adipose_bulk_final))
+signature_final    <- signature_final[common_genes, ]
+adipose_bulk_final <- adipose_bulk_final[common_genes, ]
+
+cat("Genes for deconvolution:", length(common_genes), "\n")
+cat("Signature:", dim(signature_final), "| Bulk:", dim(adipose_bulk_final), "\n\n")
+
+write.csv(signature_final, "deconv_output/signature_matrix_cat_genes.csv")
+
+## =============================================================================
+## PART 7: NNLS DECONVOLUTION
+## =============================================================================
+
+cat("=== PART 7: NNLS Deconvolution ===\n")
+
+run_nnls <- function(signature, bulk) {
+  proportions <- matrix(0, nrow = ncol(bulk), ncol = ncol(signature),
+                        dimnames = list(colnames(bulk), colnames(signature)))
+  pb <- txtProgressBar(min = 0, max = ncol(bulk), style = 3)
+  for (i in seq_len(ncol(bulk))) {
+    tryCatch({
+      props <- coef(nnls(signature, bulk[, i]))
+      if (sum(props) > 0) props <- props / sum(props)   # normalize to sum = 1
+      proportions[i, ] <- props
+    }, error = function(e) {
+      cat("\nNNLS failed for sample", colnames(bulk)[i], ":", e$message, "\n")
+    })
+    setTxtProgressBar(pb, i)
+  }
+  close(pb)
+  proportions
+}
+
+cell_proportions <- run_nnls(signature_final, adipose_bulk_final)
+cat("\nDeconvolution complete.\n\n")
+
+# Merge with metadata
+proportions_df <- as.data.frame(cell_proportions)
+proportions_df$library_ID <- rownames(proportions_df)
+proportions_df <- merge(proportions_df, metadata, by = "library_ID")
+
+cell_type_cols <- colnames(cell_proportions)
+keep_meta_cols <- c("library_ID", "title", "Animal", "Depot", "Timepoint")
+proportions_df <- proportions_df[, c(keep_meta_cols, cell_type_cols)]
+
+# Recode timepoint labels for all downstream use
+proportions_df$Timepoint <- dplyr::recode(proportions_df$Timepoint,
+  "Baseline" = "Baseline",
+  "Middle"   = "Developing obesity",
+  "End"      = "Prolonged Obesity"
+)
+proportions_df$Timepoint <- factor(proportions_df$Timepoint,
+  levels = c("Baseline", "Developing obesity", "Prolonged Obesity"))
+
+write.csv(proportions_df, "deconv_output/adipose_immune_deconvolution_results.csv",
+          row.names = FALSE)
+cat("Saved: adipose_immune_deconvolution_results.csv\n\n")
+
+## =============================================================================
+## PART 8: PREPARE CIBERSORTx VALIDATION FILES
+## =============================================================================
+
+cat("=== PART 8: Writing CIBERSORTx Validation Files ===\n")
+
+# Mixture file: cat gene symbols as row IDs
+mixture_mat <- adipose_bulk_final
+rownames(mixture_mat) <- orthologs_filtered$cat_symbol[
+  match(rownames(mixture_mat), orthologs_filtered$cat_gene)]
+write.table(cbind(GeneSymbol = rownames(mixture_mat), mixture_mat),
+            "deconv_output/CIBERSORTx_mixture_adipose.txt",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+cat("Saved: CIBERSORTx_mixture_adipose.txt\n")
+
+# Signature file: human gene symbols as row IDs
+sig_mat <- signature_final
+rownames(sig_mat) <- orthologs_filtered$human_gene[
+  match(rownames(sig_mat), orthologs_filtered$cat_gene)]
+write.table(cbind(GeneSymbol = rownames(sig_mat), sig_mat),
+            "deconv_output/CIBERSORTx_signature_adipose.txt",
+            sep = "\t", row.names = FALSE, quote = FALSE)
+cat("Saved: CIBERSORTx_signature_adipose.txt\n")
+cat("Upload both files to https://cibersortx.stanford.edu/ to validate results.\n\n")
+
+## =============================================================================
+## PART 9: PREPARE LONG-FORMAT DATA FOR VISUALIZATION
+## =============================================================================
+
+cat("=== PART 9: Preparing Visualization Data ===\n")
+
+# Remove cell types with zero signal across all samples
+active_cell_type_cols <- cell_type_cols[colSums(cell_proportions, na.rm = TRUE) > 0]
+cat("Cell types with signal:", length(active_cell_type_cols), "\n")
+
+if (length(active_cell_type_cols) == 0) {
+  warning("No cell types with signal detected — skipping visualizations.")
+} else {
+
+  # Combine and rename cell types for display
+  cell_type_labels <- c(
+    "Mac1"        = "Anti-inflammatory Macrophage",
+    "Mac2"        = "Proinflammatory Macrophage",
+    "Mac3"        = "Proinflammatory Macrophage",
+    "cDC1"        = "Dendritic cells",
+    "cDC2"        = "Dendritic cells",
+    "Mast"        = "Mast cells",
+    "Mono2"       = "Monocyte",
+    "Neu"         = "Neutrophil",
+    "NK"          = "NK cells",
+    "Plasmablast" = "Plasma cell",
+    "Tcell1"      = "Th1 cell",
+    "Tcell2"      = "Th2 cell",
+    "pDC"         = "Plasmacytoid DC",
+    "ASDC"        = "ASDC"
+  )
+
+  display_order <- c("ASDC", "Dendritic cells", "Neutrophil", "Mast cells",
+                     "Monocyte", "Proinflammatory Macrophage",
+                     "Anti-inflammatory Macrophage", "Plasma cell",
+                     "Plasmacytoid DC", "NK cells", "Th1 cell", "Th2 cell")
+
+  prop_long <- proportions_df %>%
+    dplyr::select(library_ID, title, Animal, Depot, Timepoint,
+                  all_of(active_cell_type_cols)) %>%
+    pivot_longer(cols = all_of(active_cell_type_cols),
+                 names_to = "CellType", values_to = "Proportion") %>%
+    mutate(
+      CellType = gsub("^h", "", CellType),    # strip leading "h" prefix if present
+      CellType_Display = dplyr::recode(CellType, !!!cell_type_labels, .default = CellType)
+    ) %>%
+    group_by(library_ID, title, Animal, Depot, Timepoint, CellType_Display) %>%
+    summarise(Proportion = sum(Proportion), .groups = "drop") %>%
+    mutate(CellType_Display = factor(CellType_Display, levels = display_order))
+
+  prop_means <- prop_long %>%
+    group_by(Timepoint, Depot, CellType_Display) %>%
+    summarise(Mean_Proportion = mean(Proportion, na.rm = TRUE),
+              SE = sd(Proportion, na.rm = TRUE) / sqrt(n()),
+              .groups = "drop")
+
+  prop_means_timepoint <- prop_long %>%
+    group_by(Timepoint, CellType_Display) %>%
+    summarise(Mean_Proportion = mean(Proportion, na.rm = TRUE),
+              SE = sd(Proportion, na.rm = TRUE) / sqrt(n()),
+              .groups = "drop")
+
+  ## ===========================================================================
+  ## PART 10: VISUALIZATIONS
+  ## ===========================================================================
+
+  cat("=== PART 10: Creating Plots ===\n")
+
+  # Shared theme elements
+  base_bar_theme <- theme_minimal(base_size = 11) +
+    theme(axis.text.x  = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8),
+          legend.position = "right",
+          strip.text      = element_text(face = "bold", size = 12))
+
+  pub_theme <- theme_classic(base_size = 14) +
+    theme(axis.text.x    = element_text(angle = 0, hjust = 0.5, size = 12, face = "bold"),
+          axis.text.y    = element_text(size = 12),
+          axis.title     = element_text(size = 14, face = "bold"),
+          axis.line      = element_line(linewidth = 0.8),
+          legend.position  = "right",
+          legend.text      = element_text(size = 11),
+          legend.title     = element_text(size = 12, face = "bold"),
+          plot.title       = element_text(size = 16, face = "bold", hjust = 0.5))
+
+  pub_fill <- scale_fill_manual(
+    values = colorRampPalette(RColorBrewer::brewer.pal(12, "Set3"))(
+      length(display_order)),
+    name = "Immune Cell Type"
+  )
+
+  pub_y <- scale_y_continuous(expand = c(0, 0), limits = c(0, 102),
+                               breaks = seq(0, 100, 20))
+
+  # --- Exploratory plots ------------------------------------------------------
+
+  save_pdf <- function(filename, plot, width = 14, height = 8) {
+    pdf(paste0("deconv_output/", filename), width = width, height = height)
+    print(plot); dev.off()
+    cat("  Saved:", filename, "\n")
+  }
+
+  # 1. Individual samples by timepoint
+  p1 <- ggplot(prop_long, aes(x = title, y = Proportion, fill = CellType_Display)) +
+    geom_bar(stat = "identity") +
+    facet_grid(. ~ Timepoint, scales = "free_x", space = "free") +
+    scale_fill_viridis_d(option = "turbo") + base_bar_theme +
+    labs(title = "Immune Cell Proportions Across Timepoints",
+         x = "Sample", y = "Proportion", fill = "Cell Type")
+  save_pdf("IMMUNE_01_by_timepoint.pdf", p1, 16, 8)
+
+  # 2. Individual samples by depot
+  p2 <- ggplot(prop_long, aes(x = title, y = Proportion, fill = CellType_Display)) +
+    geom_bar(stat = "identity") +
+    facet_grid(. ~ Depot, scales = "free_x", space = "free") +
+    scale_fill_viridis_d(option = "turbo") + base_bar_theme +
+    labs(title = "Immune Cell Proportions by Depot",
+         x = "Sample", y = "Proportion", fill = "Cell Type")
+  save_pdf("IMMUNE_02_by_depot.pdf", p2, 16, 8)
+
+  # 3. Box plots — cell type x depot x timepoint
+  p3 <- ggplot(prop_long, aes(x = Timepoint, y = Proportion, fill = Depot)) +
+    geom_boxplot(outlier.size = 0.5) +
+    geom_jitter(width = 0.2, alpha = 0.4, size = 1) +
+    facet_wrap(~ CellType_Display, scales = "free_y", ncol = 4) +
+    scale_fill_manual(values = depot_colors) +
+    theme_minimal(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          strip.text  = element_text(face = "bold", size = 9)) +
+    labs(title = "Cell Type Proportions: Depot Comparison",
+         y = "Proportion", x = "Timepoint")
+  save_pdf("IMMUNE_03_boxplots.pdf", p3, 14, 10)
+
+  # 4. Mean proportions by timepoint (both depots combined)
+  p4 <- ggplot(prop_means_timepoint,
+               aes(x = Timepoint, y = Mean_Proportion, fill = CellType_Display)) +
+    geom_bar(stat = "identity", position = "stack") +
+    scale_fill_viridis_d(option = "turbo") +
+    theme_minimal(base_size = 12) +
+    theme(axis.text.x    = element_text(size = 11),
+          legend.position = "right",
+          legend.title    = element_text(face = "bold")) +
+    labs(title = "Mean Immune Cell Proportions Across Timepoints",
+         subtitle = "Averaged across all samples (both depots)",
+         x = "Timepoint", y = "Mean Proportion", fill = "Cell Type")
+  save_pdf("IMMUNE_04_means_by_timepoint.pdf", p4, 10, 8)
+
+  # 5. Mean proportions by timepoint and depot
+  p5 <- ggplot(prop_means,
+               aes(x = Timepoint, y = Mean_Proportion, fill = CellType_Display)) +
+    geom_bar(stat = "identity", position = "stack") +
+    facet_wrap(~ Depot, ncol = 2) +
+    scale_fill_viridis_d(option = "turbo") +
+    theme_minimal(base_size = 12) +
+    theme(axis.text.x    = element_text(size = 11),
+          strip.text      = element_text(face = "bold", size = 12),
+          legend.position = "right",
+          legend.title    = element_text(face = "bold")) +
+    labs(title = "Mean Immune Cell Proportions by Timepoint and Depot",
+         x = "Timepoint", y = "Mean Proportion", fill = "Cell Type")
+  save_pdf("IMMUNE_05_means_by_timepoint_depot.pdf", p5, 12, 8)
+
+  # 6. Depot comparison at each timepoint
+  p6 <- ggplot(prop_means,
+               aes(x = Depot, y = Mean_Proportion, fill = CellType_Display)) +
+    geom_bar(stat = "identity", position = "stack", width = 0.7) +
+    facet_wrap(~ Timepoint, ncol = 3) +
+    scale_fill_viridis_d(option = "turbo") +
+    theme_minimal(base_size = 12) +
+    theme(axis.text.x    = element_text(angle = 45, hjust = 1, size = 11),
+          strip.text      = element_text(face = "bold", size = 12),
+          legend.position = "right",
+          legend.title    = element_text(face = "bold")) +
+    labs(title = "Mean Immune Cell Proportions: Depot Comparison",
+         x = "Depot", y = "Mean Proportion", fill = "Cell Type")
+  save_pdf("IMMUNE_06_means_depot_comparison.pdf", p6, 14, 8)
+
+  # 7. Trend lines over time (mean ± SE)
+  p7 <- ggplot(prop_means,
+               aes(x = Timepoint, y = Mean_Proportion,
+                   color = CellType_Display, group = CellType_Display)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = Mean_Proportion - SE,
+                      ymax = Mean_Proportion + SE), width = 0.2, alpha = 0.5) +
+    facet_wrap(~ Depot, ncol = 2) +
+    scale_color_viridis_d(option = "turbo") +
+    theme_minimal(base_size = 11) +
+    theme(strip.text      = element_text(face = "bold", size = 12),
+          legend.position = "right",
+          legend.title    = element_text(face = "bold")) +
+    labs(title = "Immune Cell Proportion Trends Over Time",
+         subtitle = "Mean ± SE by depot",
+         x = "Timepoint", y = "Mean Proportion", color = "Cell Type")
+  save_pdf("IMMUNE_07_trends_over_time.pdf", p7, 14, 10)
+
+  # 8. Heatmap of mean proportions
+  heatmap_wide <- prop_means %>%
+    mutate(Group = paste(Depot, Timepoint, sep = "_")) %>%
+    dplyr::select(Group, CellType_Display, Mean_Proportion) %>%
+    pivot_wider(names_from = CellType_Display, values_from = Mean_Proportion) %>%
+    as.data.frame()
+  rownames(heatmap_wide) <- heatmap_wide$Group
+  heatmap_wide$Group     <- NULL
+
+  pdf("deconv_output/IMMUNE_08_heatmap.pdf", width = 10, height = 8)
+  pheatmap(as.matrix(heatmap_wide),
+           cluster_rows = FALSE, cluster_cols = TRUE,
+           color     = viridis(100),
+           main      = "Immune Cell Proportions — Mean by Depot and Timepoint",
+           fontsize  = 10, fontsize_row = 9, fontsize_col = 9, angle_col = 45)
+  dev.off()
+  cat("  Saved: IMMUNE_08_heatmap.pdf\n")
+
+  # --- Publication-ready plots ------------------------------------------------
+
+  make_pub_bar <- function(data, depot_label) {
+    ggplot(data, aes(x = Timepoint, y = Mean_Proportion * 100,
+                     fill = CellType_Display)) +
+      geom_bar(stat = "identity", color = "black", linewidth = 0.3) +
+      pub_fill + pub_theme + pub_y +
+      labs(title = paste(depot_label, "— Immune Cell Proportions"),
+           x = "Timepoint", y = "Percentage (%)")
+  }
+
+  save_pub <- function(filename_base, plot, width, height) {
+    pdf(paste0("deconv_output/", filename_base, ".pdf"), width = width, height = height)
+    print(plot); dev.off()
+    png(paste0("deconv_output/", filename_base, ".png"),
+        width = width, height = height, units = "in", res = 300)
+    print(plot); dev.off()
+    cat("  Saved:", filename_base, ".pdf/.png\n")
+  }
+
+  p_pub_ab <- make_pub_bar(prop_means %>% filter(Depot == "Abdominal"),
+                           "Abdominal Adipose")
+  save_pub("IMMUNE_publication_abdominal", p_pub_ab, 10, 8)
+
+  p_pub_sq <- make_pub_bar(prop_means %>% filter(Depot == "Subcutaneous"),
+                           "Subcutaneous Adipose")
+  save_pub("IMMUNE_publication_subcutaneous", p_pub_sq, 10, 8)
+
+  # Combined: all depots and timepoints in one panel
+  prop_means_combined <- prop_means %>%
+    mutate(Group = factor(
+      paste(Depot, Timepoint, sep = "\n"),
+      levels = c("Abdominal\nBaseline",           "Abdominal\nDeveloping obesity",
+                 "Abdominal\nProlonged Obesity",  "Subcutaneous\nBaseline",
+                 "Subcutaneous\nDeveloping obesity", "Subcutaneous\nProlonged Obesity")
+    ))
+
+  p_pub_combined <- ggplot(prop_means_combined,
+                           aes(x = Group, y = Mean_Proportion * 100,
+                               fill = CellType_Display)) +
+    geom_bar(stat = "identity", color = "black", linewidth = 0.3) +
+    geom_vline(xintercept = 3.5, linetype = "dashed",
+               color = "gray40", linewidth = 0.6) +
+    pub_fill + pub_theme + pub_y +
+    theme(axis.text.x = element_text(size = 11, face = "bold")) +
+    labs(title = "Immune Cell Proportions — All Conditions",
+         x = "Depot and Timepoint", y = "Percentage (%)")
+  save_pub("IMMUNE_publication_combined", p_pub_combined, 14, 8)
+
+} # end visualization block
+
+## =============================================================================
+## PART 11: SUMMARY PROPORTION TABLE
+## =============================================================================
+
+cat("\n=== PART 11: Summary Table ===\n")
+
+summary_table <- prop_long %>%
+  group_by(Depot, Timepoint, CellType_Display) %>%
+  summarise(Mean_Proportion = mean(Proportion, na.rm = TRUE) * 100, .groups = "drop") %>%
+  mutate(Group = paste(Depot, Timepoint, sep = "_")) %>%
+  dplyr::select(CellType_Display, Group, Mean_Proportion) %>%
+  pivot_wider(names_from = Group, values_from = Mean_Proportion) %>%
+  mutate(across(where(is.numeric), ~ sprintf("%.2f%%", .)))
+
+col_order <- c("CellType_Display",
+               "Abdominal_Baseline", "Abdominal_Developing obesity", "Abdominal_Prolonged Obesity",
+               "Subcutaneous_Baseline", "Subcutaneous_Developing obesity", "Subcutaneous_Prolonged Obesity")
+summary_table <- summary_table %>% dplyr::select(any_of(col_order))
+
+write.csv(summary_table, "deconv_output/immune_summary_proportion_table.csv", row.names = FALSE)
+cat("Saved: immune_summary_proportion_table.csv\n\n")
+
+## =============================================================================
+## PART 12: STATISTICAL TESTS (paired Wilcoxon, FDR corrected)
+## =============================================================================
+
+cat("=== PART 12: Statistical Tests ===\n")
+
+run_pairwise_wilcox <- function(data, depot_name) {
+  depot_data <- data %>% filter(Depot == depot_name)
+  comparisons <- list(
+    "Baseline vs Developing obesity" = c("Baseline", "Developing obesity"),
+    "Baseline vs Prolonged Obesity"  = c("Baseline", "Prolonged Obesity"),
+    "Developing obesity vs Prolonged Obesity" = c("Developing obesity", "Prolonged Obesity")
+  )
+  results <- lapply(unique(depot_data$CellType_Display), function(ct) {
+    cell_data <- depot_data %>% filter(CellType_Display == ct)
+    lapply(names(comparisons), function(comp_name) {
+      tp <- comparisons[[comp_name]]
+      g1 <- cell_data %>% filter(Timepoint == tp[1]) %>% pull(Proportion)
+      g2 <- cell_data %>% filter(Timepoint == tp[2]) %>% pull(Proportion)
+      p  <- tryCatch(
+        wilcox.test(g1, g2, paired = TRUE, exact = FALSE)$p.value,
+        error = function(e) NA_real_
+      )
+      data.frame(Depot = depot_name, CellType = ct, Comparison = comp_name,
+                 P_value = p, stringsAsFactors = FALSE)
+    })
+  })
+  do.call(rbind, unlist(results, recursive = FALSE))
+}
+
+stats_all <- rbind(
+  run_pairwise_wilcox(prop_long, "Abdominal"),
+  run_pairwise_wilcox(prop_long, "Subcutaneous")
+)
+
+stats_all$P_adjusted <- p.adjust(stats_all$P_value, method = "fdr")
+stats_all$Significance <- dplyr::case_when(
+  stats_all$P_adjusted < 0.001 ~ "***",
+  stats_all$P_adjusted < 0.01  ~ "**",
+  stats_all$P_adjusted < 0.05  ~ "*",
+  stats_all$P_adjusted < 0.1   ~ ".",
+  TRUE ~ "ns"
+)
+
+stats_out <- stats_all %>%
+  mutate(across(c(P_value, P_adjusted), ~ sprintf("%.4f", .))) %>%
+  rename(`P-value` = P_value, `Adj. P-value` = P_adjusted, `Sig.` = Significance)
+
+write.csv(stats_out,
+          "deconv_output/immune_statistical_tests_timepoint_comparisons.csv",
+          row.names = FALSE)
+
+# Wide format for easy reading
+stats_wide <- stats_all %>%
+  mutate(Result = paste0(sprintf("%.4f", P_adjusted), " (", Significance, ")")) %>%
+  dplyr::select(Depot, CellType, Comparison, Result) %>%
+  pivot_wider(names_from = Comparison, values_from = Result)
+
+write.csv(stats_wide,
+          "deconv_output/immune_statistical_tests_wide_format.csv",
+          row.names = FALSE)
+cat("Saved: statistical test tables\n")
+
+sig_hits <- stats_all %>% filter(P_adjusted < 0.05) %>% arrange(P_adjusted)
+if (nrow(sig_hits) > 0) {
+  cat("\nSignificant findings (adj. p < 0.05):\n")
+  print(sig_hits[, c("Depot","CellType","Comparison","P_adjusted","Significance")])
+} else {
+  cat("No significant differences after FDR correction.\n")
+}
+cat("\n")
+
+## =============================================================================
+## PART 13: CELL TYPE REFERENCE TABLE
+## =============================================================================
+
+cat("=== PART 13: Cell Type Reference ===\n")
+
+cell_type_reference <- data.frame(
+  Display_Name = c(
+    "Anti-inflammatory Macrophage", "Proinflammatory Macrophage",
+    "Monocyte", "Dendritic cells", "Plasmacytoid DC", "ASDC",
+    "Mast cells", "Neutrophil", "NK cells",
+    "Plasma cell", "Th1 cell", "Th2 cell"
+  ),
+  Original_Label = c(
+    "Mac1", "Mac2 + Mac3 (combined)",
+    "Mono2", "cDC1 + cDC2 (combined)", "pDC", "ASDC",
+    "Mast", "Neu", "NK",
+    "Plasmablast", "Tcell1", "Tcell2"
+  ),
+  Category = c(
+    "Myeloid - Tissue Resident", "Myeloid - Tissue Resident",
+    "Myeloid - Circulating", "Myeloid - Antigen Presenting",
+    "Myeloid - Antigen Presenting", "Myeloid - Antigen Presenting",
+    "Myeloid - Effector", "Myeloid - Effector",
+    "Lymphoid - Innate", "Lymphoid - B Cell Lineage",
+    "Lymphoid - T Cell", "Lymphoid - T Cell"
+  ),
+  Key_Markers = c(
+    "CD14+, CD68+, MerTK+",
+    "Mac2: CD206+, CD163+; Mac3: CD86+, HLA-DR+, TNF+",
+    "CD14+, CD16+, CCR2+",
+    "cDC1: XCR1+, CLEC9A+; cDC2: CD1c+, CLEC10A+",
+    "CD123+, CLEC4C+, IL3RA+",
+    "AXL+, SIGLEC6+, CD22+",
+    "KIT+, TPSAB1+, CPA3+",
+    "CD66b+, MPO+, ELANE+",
+    "CD56+, NKG7+, GNLY+",
+    "CD27+, CD38+, XBP1+",
+    "CD3+, CD4+, IFNg+",
+    "CD3+, CD4+, IL-4+"
+  ),
+  Adipose_Relevance = c(
+    "Metabolic homeostasis, insulin sensitivity",
+    "Obesity-associated inflammation, lipid metabolism",
+    "Recruited during obesity; insulin resistance",
+    "Antigen presentation; adaptive immune bridge",
+    "Anti-viral response; metabolic inflammation",
+    "Inflammatory regulation, DC development",
+    "Adipose tissue inflammation in obesity",
+    "Acute inflammation; tissue remodeling",
+    "Metabolic regulation; tissue surveillance",
+    "Local antibody production; chronic inflammation",
+    "Pro-inflammatory cytokines; insulin resistance",
+    "Anti-inflammatory cytokines; metabolic homeostasis"
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(cell_type_reference,
+          "deconv_output/immune_cell_type_reference.csv", row.names = FALSE)
+cat("Saved: immune_cell_type_reference.csv\n\n")
+
+cat("=== Analysis complete. All outputs written to deconv_output/ ===\n")

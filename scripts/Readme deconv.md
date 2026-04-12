@@ -170,4 +170,4 @@ BiocManager::install(c("DESeq2", "biomaRt", "SingleCellExperiment"))
 
 **Samira Salimiiyan**  
 Auburn University  
-Contact: [your email here]
+Contact: [szs0394@auburn.edu]

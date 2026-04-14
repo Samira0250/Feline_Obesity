@@ -16,8 +16,8 @@ The pipeline covers two independent analyses:
 1. **Differential Gene Expression (DGE)** — identifying genes that change across timepoints using DESeq2, visualized with volcano plots, heatmaps, and GO Biological Process enrichment.
 2. **Immune Cell Deconvolution** — estimating immune cell-type proportions in bulk RNA-seq data using a human single-cell reference and NNLS regression, validated against CIBERSORTx.
 
-> Associated manuscript: *[Your paper title here]*  
-> GEO accession: *[Accession number here]*
+> Associated manuscript: *Chronic Obesity in Domestic Cats Does Not Induce a Classic Inflammatory Response*  
+> GEO accession: *PRJNA940803*
 
 ---
 

@@ -17,7 +17,7 @@ The pipeline covers two independent analyses:
 2. **Immune Cell Deconvolution** — estimating immune cell-type proportions in bulk RNA-seq data using a human single-cell reference and NNLS regression, validated against CIBERSORTx.
 
 > Associated manuscript: *Chronic Obesity in Domestic Cats Does Not Induce a Classic Inflammatory Response*  
-> GEO accession: *PRJNA940803*
+> GEO accession: *PRJNA940803* [(https://www.ncbi.nlm.nih.gov/bioproject/?term=PRJNA940803)]
 
 ---
 
